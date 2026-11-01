@@ -4,10 +4,14 @@ use crate::parity::{
     Action, CallAction, CreateAction, CreateOutput, RewardAction, SelfdestructAction, TraceOutput,
     TransactionTrace,
 };
-use alloy_eips::{eip1898::lenient_block_number_or_tag, BlockNumberOrTag};
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{map::AddressHashSet, Address, BlockHash};
 use alloy_rpc_types_eth::FilterBlockOption;
-use serde::{Deserialize, Serialize};
+use core::fmt;
+use serde::{
+    de::{self, Unexpected, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 
 /// Trace filter.
 ///
@@ -25,14 +29,14 @@ pub struct TraceFilter {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "lenient_block_number_or_tag::opt::deserialize"
+        deserialize_with = "deserialize_block_bound"
     )]
     pub from_block: Option<BlockNumberOrTag>,
     /// To block
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "lenient_block_number_or_tag::opt::deserialize"
+        deserialize_with = "deserialize_block_bound"
     )]
     pub to_block: Option<BlockNumberOrTag>,
     /// From address
@@ -279,6 +283,67 @@ impl TraceFilterMatcher {
     }
 }
 
+/// Deserializes an optional [`TraceFilter`] range bound.
+///
+/// A bound is a block number, as a JSON integer or a string of hex digits after `0x` or of decimal
+/// digits, or a lowercase block tag.
+fn deserialize_block_bound<'de, D>(deserializer: D) -> Result<Option<BlockNumberOrTag>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BlockBoundVisitor;
+
+    impl<'de> Visitor<'de> for BlockBoundVisitor {
+        type Value = Option<BlockNumberOrTag>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a block number or tag")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.into()))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let block = match v {
+                "earliest" => BlockNumberOrTag::Earliest,
+                "latest" => BlockNumberOrTag::Latest,
+                "safe" => BlockNumberOrTag::Safe,
+                "finalized" => BlockNumberOrTag::Finalized,
+                "pending" => BlockNumberOrTag::Pending,
+                _ => {
+                    let (digits, radix) =
+                        match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                            Some(digits) => (digits, 16),
+                            None => (v, 10),
+                        };
+                    // `from_str_radix` also takes a leading `+`.
+                    if digits.starts_with('+') {
+                        return Err(E::invalid_value(Unexpected::Str(v), &self));
+                    }
+                    u64::from_str_radix(digits, radix)
+                        .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))?
+                        .into()
+                }
+            };
+            Ok(Some(block))
+        }
+    }
+
+    deserializer.deserialize_option(BlockBoundVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,7 +457,16 @@ mod tests {
             json!({ "fromBlock": "0o2" }),
             json!({ "fromBlock": "1_000" }),
             json!({ "fromBlock": "0x1_0" }),
+            json!({ "fromBlock": "+1" }),
+            json!({ "fromBlock": "-1" }),
+            json!({ "fromBlock": "0x+1" }),
+            json!({ "fromBlock": "0x-1" }),
+            json!({ "fromBlock": "+0x1" }),
+            json!({ "fromBlock": " 0x1" }),
             json!({ "toBlock": "unknown" }),
+            json!({ "toBlock": "Latest" }),
+            json!({ "toBlock": "SAFE" }),
+            json!({ "toBlock": "Pending" }),
         ] {
             assert!(serde_json::from_value::<TraceFilter>(filter.clone()).is_err(), "{filter}");
         }
@@ -434,6 +508,8 @@ mod tests {
     fn block_numbers_are_quantities() {
         for (number, expected) in [
             (json!("0x2"), 2),
+            (json!("0X2"), 2),
+            (json!("0x02"), 2),
             (json!(2), 2),
             (json!("2"), 2),
             (json!("0x0"), 0),
